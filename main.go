@@ -17,14 +17,33 @@ import (
 )
 
 func main() {
+	if _, err := host.Init(); err != nil {
+		log.Fatal(err)
+	}
+
 	servoOnName := "GPIO23"
 	servoOffName := "GPIO25"
 	servoOn, servoOff := initServos(servoOnName, servoOffName)
 
+	defer func() {
+        fmt.Println("Cleaning up servos...")
+		servoOn.Out(gpio.Low)
+		servoOff.Out(gpio.Low)
+		servoOn.Halt()
+		servoOff.Halt()
+    }()
+
 	lightSensor := initLightSensor()
 
 	times := make(chan time.Time)
-	initMic(times)
+	mic := initMic(times)
+
+	defer func() {
+		fmt.Println("Cleaning up microphone...")
+		mic.Stop()
+		mic.Close()
+		portaudio.Terminate()
+	}()
 
 	prevClaptime := time.Now()
 	for {
@@ -48,12 +67,10 @@ func main() {
 			if lightVal < 2 {
 				fmt.Println("Light Off")
 				fmt.Println("Activate Servo On")
-				continue
 				activateServo(servoOn)
 			} else if false {
 				fmt.Println("Light On")
 				fmt.Println("Activate Servo Off")
-				continue
 				activateServo(servoOff)
 			}
 
@@ -66,10 +83,6 @@ func main() {
 }
 
 func initServos(servoOnName string, servoOffName string) (gpio.PinIO, gpio.PinIO) {
-	if _, err := host.Init(); err != nil {
-		log.Fatal(err)
-	}
-
 	servoOn := gpioreg.ByName(servoOnName)
 	if servoOn == nil {
 		log.Fatalf("Failed to find %s", servoOn)
@@ -83,14 +96,17 @@ func initServos(servoOnName string, servoOffName string) (gpio.PinIO, gpio.PinIO
 	fmt.Printf("%s is %s\n", servoOff, servoOff.Read())
 
 	// init servo to neutral position
-	// if err := servoOn.PWM(gpio.DutyMax*75/1000, 50*physic.Hertz); err != nil {
-	// 	log.Fatal(err)
-	// }
-	//
-	// time.Sleep(1 * time.Second)
-	// if err := servoOff.PWM(gpio.DutyMax*75/1000, 50*physic.Hertz); err != nil {
-	// 	log.Fatal(err)
-	// }
+	if err := servoOn.PWM(gpio.DutyMax*75/1000, 50*physic.Hertz); err != nil {
+		log.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	servoOn.Halt()
+	
+	if err := servoOff.PWM(gpio.DutyMax*75/1000, 50*physic.Hertz); err != nil {
+		log.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	servoOff.Halt()
 
 	return servoOn, servoOff
 }
@@ -101,18 +117,17 @@ func activateServo(servo gpio.PinIO) {
 		log.Fatalf("Failed to activate servo: %v", err)
 	}
 
-	time.Sleep(1 * time.Second)
+	time.Sleep(500 * time.Millisecond)
 	// bring servo back to neutral position
 	if err := servo.PWM(gpio.DutyMax*75/1000, 50*physic.Hertz); err != nil {
 		log.Fatalf("Failed to reset servo: %v", err)
 	}
+
+	time.Sleep(500 * time.Millisecond)
+	servo.Halt()
 }
 
 func initLightSensor() i2c.Dev {
-	if _, err := host.Init(); err != nil {
-		log.Fatal(err)
-	}
-
 	bus, err := i2creg.Open("")
 	if err != nil {
 		log.Fatal(err)
@@ -129,14 +144,14 @@ func initLightSensor() i2c.Dev {
 	return *lightSensor
 }
 
-func initMic(times chan time.Time) {
+func initMic(times chan time.Time) *portaudio.Stream {
 	if err := portaudio.Initialize(); err != nil {
 		log.Fatalf("Failed to initialize PortAudio: %v", err)
 	}
 
 	mic, streamErr := portaudio.OpenDefaultStream(1, 0, 48000.0, 256, func(in []float32, out []float32) {
 		for i := 1; i < len(in)-1; i++ {
-			clapThreshold := 0.10
+			clapThreshold := 0.08
 
 			prev := math.Abs(float64(in[i-1]))
 			cur := math.Abs(float64(in[i]))
@@ -157,4 +172,5 @@ func initMic(times chan time.Time) {
 	}
 
 	fmt.Println("Mic Listening...")
+	return mic
 }
