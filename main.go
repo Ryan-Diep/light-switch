@@ -1,133 +1,130 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 	"math"
+	"os"
+	"os/signal"
+	"net"
+	"syscall"
 	"time"
 
-	"periph.io/x/conn/v3/gpio"
-	"periph.io/x/conn/v3/gpio/gpioreg"
 	"periph.io/x/conn/v3/i2c"
 	"periph.io/x/conn/v3/i2c/i2creg"
-	"periph.io/x/conn/v3/physic"
 	"periph.io/x/host/v3"
 
 	"github.com/gordonklaus/portaudio"
 )
 
+const (
+	SERVO_ON_PIN = 12
+	SERVO_OFF_PIN = 18
+)
+
 func main() {
-	if _, err := host.Init(); err != nil {
-		log.Fatal(err)
-	}
+	// signal channel to listen for interrupt signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	servoOnName := "GPIO23"
-	servoOffName := "GPIO25"
-	servoOn, servoOff := initServos(servoOnName, servoOffName)
-
-	defer func() {
-        fmt.Println("Cleaning up servos...")
-		servoOn.Out(gpio.Low)
-		servoOff.Out(gpio.Low)
-		servoOn.Halt()
-		servoOff.Halt()
-    }()
-
-	lightSensor := initLightSensor()
-
+	// init devices
+	conn := initServos()
 	times := make(chan time.Time)
+	lightSensor, lightBus := initLightSensor()
 	mic := initMic(times)
-
-	defer func() {
-		fmt.Println("Cleaning up microphone...")
-		mic.Stop()
-		mic.Close()
-		portaudio.Terminate()
-	}()
-
 	prevClaptime := time.Now()
-	for {
-		clapTime := <-times
 
-		if clapTime.Sub(prevClaptime).Milliseconds() > 30 && clapTime.Sub(prevClaptime).Milliseconds() < 500 {
-			prevClaptime = clapTime
-			fmt.Println("Clap 2")
+	// close device resources
+	defer closeDeviceResources(mic, lightBus, conn)
 
-			readCmd := []byte{0xB4}
-			readBuffer := make([]byte, 2)
-			if err := lightSensor.Tx(readCmd, readBuffer); err != nil {
-				log.Fatalf("Failed to read from light sensor: %v", err)
+	running := true
+
+	// main loop
+	for running {
+		select {
+		case <-sigChan:
+			fmt.Println("Shutting down...")
+			running = false
+		
+		case clapTime := <-times:
+			if clapTime.Sub(prevClaptime).Milliseconds() > 100 && clapTime.Sub(prevClaptime).Milliseconds() < 500 {
+				prevClaptime = clapTime
+				fmt.Println("Clap 2")
+
+				readCmd := []byte{0xB4}
+				readBuffer := make([]byte, 2)
+				if err := lightSensor.Tx(readCmd, readBuffer); err != nil {
+					log.Fatalf("Failed to read from light sensor: %v", err)
+				}
+
+				// the high and low readings together make up the read value
+				// bitshift the high reading by 8 bits
+				// then bitwise or the 2 to combine them into a single int
+				lightVal := uint16(readBuffer[1])<<8 | uint16(readBuffer[0])
+				fmt.Println(lightVal)
+				if lightVal < 3 {
+					fmt.Println("Light Off")
+					setServo(conn, SERVO_ON_PIN, angleToPulse(0))
+					time.Sleep(500 * time.Millisecond)
+					setServo(conn, SERVO_ON_PIN, angleToPulse(90))
+				} else {
+					fmt.Println("Light On")
+					setServo(conn, SERVO_OFF_PIN, angleToPulse(0))
+					time.Sleep(500 * time.Millisecond)
+					setServo(conn, SERVO_OFF_PIN, angleToPulse(90))
+				}
+				for len(times) > 0 {
+					<-times
+				}
+			} else if clapTime.Sub(prevClaptime).Milliseconds() > 200 {
+				prevClaptime = clapTime
+				fmt.Println("Clap 1")
 			}
-
-			// the high and low readings together make up the read value
-			// bitshift the high reading by 8 bits
-			// then bitwise or the 2 to combine them into a single int
-			lightVal := uint16(readBuffer[1])<<8 | uint16(readBuffer[0])
-			fmt.Println(lightVal)
-			if lightVal < 2 {
-				fmt.Println("Light Off")
-				fmt.Println("Activate Servo On")
-				activateServo(servoOn)
-			} else if false {
-				fmt.Println("Light On")
-				fmt.Println("Activate Servo Off")
-				activateServo(servoOff)
-			}
-
-		} else if clapTime.Sub(prevClaptime).Milliseconds() > 200 {
-			prevClaptime = clapTime
-			fmt.Println("Clap 1")
 		}
 	}
 
 }
 
-func initServos(servoOnName string, servoOffName string) (gpio.PinIO, gpio.PinIO) {
-	servoOn := gpioreg.ByName(servoOnName)
-	if servoOn == nil {
-		log.Fatalf("Failed to find %s", servoOn)
+// servo functions
+func initServos() net.Conn {
+	conn, err := net.Dial("tcp", "localhost:8888")
+	if err != nil {
+		log.Fatal("Failed to connect. Run: sudo pigpiod")
 	}
-	fmt.Printf("%s is %s\n", servoOn, servoOn.Read())
 
-	servoOff := gpioreg.ByName(servoOffName)
-	if servoOff == nil {
-		log.Fatalf("Failed to find %s", servoOff)
-	}
-	fmt.Printf("%s is %s\n", servoOff, servoOff.Read())
+	// reset servo positions
+	setServo(conn, SERVO_ON_PIN, angleToPulse(0))
+	setServo(conn, SERVO_OFF_PIN, angleToPulse(0))
 
-	// init servo to neutral position
-	if err := servoOn.PWM(gpio.DutyMax*75/1000, 50*physic.Hertz); err != nil {
-		log.Fatal(err)
-	}
-	time.Sleep(500 * time.Millisecond)
-	servoOn.Halt()
+	return conn
+}
+
+func setServo(conn net.Conn, pin uint32, pulsewidth uint32) error {
+	buf := make([]byte, 16)
 	
-	if err := servoOff.PWM(gpio.DutyMax*75/1000, 50*physic.Hertz); err != nil {
+	// CMD_SERVO
+	binary.LittleEndian.PutUint32(buf[0:4], 8) 
+	binary.LittleEndian.PutUint32(buf[4:8], pin)
+	binary.LittleEndian.PutUint32(buf[8:12], pulsewidth)
+	
+	conn.Write(buf)
+	response := make([]byte, 16)
+	conn.Read(response)
+	
+	return nil
+}
+
+func angleToPulse(angle int) uint32 {
+	return uint32(500 + (angle * 2000 / 180))
+}
+
+// light sensor functions
+func initLightSensor() (*i2c.Dev, i2c.BusCloser) {
+	if _, err := host.Init(); err != nil {
 		log.Fatal(err)
 	}
-	time.Sleep(500 * time.Millisecond)
-	servoOff.Halt()
 
-	return servoOn, servoOff
-}
-
-func activateServo(servo gpio.PinIO) {
-	// move servo to press light switch
-	if err := servo.PWM(gpio.DutyMax*5/100, 50*physic.Hertz); err != nil {
-		log.Fatalf("Failed to activate servo: %v", err)
-	}
-
-	time.Sleep(500 * time.Millisecond)
-	// bring servo back to neutral position
-	if err := servo.PWM(gpio.DutyMax*75/1000, 50*physic.Hertz); err != nil {
-		log.Fatalf("Failed to reset servo: %v", err)
-	}
-
-	time.Sleep(500 * time.Millisecond)
-	servo.Halt()
-}
-
-func initLightSensor() i2c.Dev {
 	bus, err := i2creg.Open("")
 	if err != nil {
 		log.Fatal(err)
@@ -141,23 +138,24 @@ func initLightSensor() i2c.Dev {
 		log.Fatal(err)
 	}
 
-	return *lightSensor
+	return lightSensor, bus
 }
 
+// mic functions
 func initMic(times chan time.Time) *portaudio.Stream {
 	if err := portaudio.Initialize(); err != nil {
 		log.Fatalf("Failed to initialize PortAudio: %v", err)
 	}
 
 	mic, streamErr := portaudio.OpenDefaultStream(1, 0, 48000.0, 256, func(in []float32, out []float32) {
+		clapThreshold := 0.10
 		for i := 1; i < len(in)-1; i++ {
-			clapThreshold := 0.08
-
 			prev := math.Abs(float64(in[i-1]))
 			cur := math.Abs(float64(in[i]))
 			next := math.Abs(float64(in[i+1]))
 			if max(cur-prev) > clapThreshold || max(cur-next) > clapThreshold {
-				times <- time.Now()
+				now := time.Now()
+				times <- now
 				break
 			}
 		}
@@ -173,4 +171,18 @@ func initMic(times chan time.Time) *portaudio.Stream {
 
 	fmt.Println("Mic Listening...")
 	return mic
+}
+
+// clean up functions
+func closeDeviceResources(mic *portaudio.Stream, lightBus i2c.BusCloser, conn net.Conn) {
+	fmt.Println("Cleaning up microphone...")
+	mic.Stop()
+	mic.Close()
+	portaudio.Terminate()
+
+	fmt.Println("Cleaning up light sensor...")
+	lightBus.Close()
+
+	fmt.Println("Cleaning up servos...")
+	conn.Close()
 }
