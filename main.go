@@ -70,7 +70,7 @@ func main() {
 					setServo(conn, SERVO_ON_PIN, angleToPulse(90))
 				} else {
 					fmt.Println("Light On")
-					setServo(conn, SERVO_OFF_PIN, angleToPulse(0))
+					setServo(conn, SERVO_OFF_PIN, angleToPulse(180))
 					time.Sleep(500 * time.Millisecond)
 					setServo(conn, SERVO_OFF_PIN, angleToPulse(90))
 				}
@@ -94,8 +94,8 @@ func initServos() net.Conn {
 	}
 
 	// reset servo positions
-	setServo(conn, SERVO_ON_PIN, angleToPulse(0))
-	setServo(conn, SERVO_OFF_PIN, angleToPulse(0))
+	setServo(conn, SERVO_ON_PIN, angleToPulse(90))
+	setServo(conn, SERVO_OFF_PIN, angleToPulse(90))
 
 	return conn
 }
