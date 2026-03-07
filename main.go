@@ -67,12 +67,12 @@ func main() {
 					fmt.Println("Light Off")
 					setServo(conn, SERVO_ON_PIN, angleToPulse(0))
 					time.Sleep(500 * time.Millisecond)
-					setServo(conn, SERVO_ON_PIN, angleToPulse(90))
+					setServo(conn, SERVO_ON_PIN, angleToPulse(180))
 				} else {
 					fmt.Println("Light On")
 					setServo(conn, SERVO_OFF_PIN, angleToPulse(180))
 					time.Sleep(500 * time.Millisecond)
-					setServo(conn, SERVO_OFF_PIN, angleToPulse(90))
+					setServo(conn, SERVO_OFF_PIN, angleToPulse(0))
 				}
 				for len(times) > 0 {
 					<-times
@@ -94,8 +94,8 @@ func initServos() net.Conn {
 	}
 
 	// reset servo positions
-	setServo(conn, SERVO_ON_PIN, angleToPulse(90))
-	setServo(conn, SERVO_OFF_PIN, angleToPulse(90))
+	setServo(conn, SERVO_ON_PIN, angleToPulse(180))
+	setServo(conn, SERVO_OFF_PIN, angleToPulse(0))
 
 	return conn
 }
@@ -148,14 +148,22 @@ func initMic(times chan time.Time) *portaudio.Stream {
 	}
 
 	mic, streamErr := portaudio.OpenDefaultStream(1, 0, 48000.0, 256, func(in []float32, out []float32) {
-		clapThreshold := 0.10
-		for i := 1; i < len(in)-1; i++ {
+		hardRiseThreshold := 0.20   
+		softRiseThreshold := 0.10  
+		decayThreshold    := 0.05   
+
+		for i := 1; i < len(in)-2; i++ {
 			prev := math.Abs(float64(in[i-1]))
-			cur := math.Abs(float64(in[i]))
+			cur  := math.Abs(float64(in[i]))
 			next := math.Abs(float64(in[i+1]))
-			if max(cur-prev) > clapThreshold || max(cur-next) > clapThreshold {
-				now := time.Now()
-				times <- now
+
+			rise := cur - prev
+			fall := cur - next
+
+			isClap := rise > hardRiseThreshold || (rise > softRiseThreshold && fall > decayThreshold)
+
+			if isClap {
+				times <- time.Now()
 				break
 			}
 		}
